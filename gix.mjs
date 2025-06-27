@@ -41,18 +41,33 @@ class Gix {
     }
 
     async add(filePath) {
-        const data = await fs.readFile(filePath, 'utf-8');
-        const hash = this.hashObject(data);
-        const objectPath = path.join(this.objectPath, hash);
-        await fs.writeFile(objectPath, data);
-        await this.updateIndex(filePath, hash);
-        console.log(`Added: ${filePath}`);
+        try {
+            const data = await fs.readFile(filePath, 'utf-8');
+            const hash = this.hashObject(data);
+            const objectPath = path.join(this.objectPath, hash);
+            await fs.writeFile(objectPath, data);
+            await this.updateIndex(filePath, hash);
+            console.log(`Added: ${filePath}`);
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                await this.removeFromIndex(filePath);
+                console.log(`Removed from index: ${filePath} (staged for deletion)`);
+            } else {
+                throw error;
+            }
+        }
     }
 
     async updateIndex(filePath, hash) {
         const index = JSON.parse(await fs.readFile(this.indexPath, 'utf-8'));
         const filtered = index.filter(entry => entry.path !== filePath);
         filtered.push({ path: filePath, hash });
+        await fs.writeFile(this.indexPath, JSON.stringify(filtered));
+    }
+
+    async removeFromIndex(filePath) {
+        const index = JSON.parse(await fs.readFile(this.indexPath, 'utf-8'));
+        const filtered = index.filter(entry => entry.path !== filePath);
         await fs.writeFile(this.indexPath, JSON.stringify(filtered));
     }
 
@@ -171,7 +186,6 @@ class Gix {
         return await fs.readFile(path.join(this.objectPath, hash), 'utf-8');
     }
 
-    // === Branching Methods ===
     async createBranch(branchName) {
         const currentHeadCommit = await this.getCurrentHead();
         if (!currentHeadCommit) {
@@ -276,17 +290,151 @@ class Gix {
             }
         }
     }
+
+    async status() {
+        await this.ready;
+
+        const headCommitHash = await this.getCurrentHead();
+        let headFiles = new Map();
+        if (headCommitHash) {
+            try {
+                const commitData = JSON.parse(await fs.readFile(path.join(this.objectPath, headCommitHash), 'utf-8'));
+                commitData.files.forEach(f => headFiles.set(f.path, f.hash));
+            } catch (error) {
+                console.error(chalk.red(`Warning: Error reading HEAD commit (${headCommitHash}): ${error.message}`));
+            }
+        }
+
+        const indexEntries = JSON.parse(await fs.readFile(this.indexPath, 'utf-8'));
+        const indexFiles = new Map();
+        indexEntries.forEach(entry => indexFiles.set(entry.path, entry.hash));
+
+        const workingDirectoryFiles = new Map();
+        const untrackedFiles = [];
+        const changesNotStaged = [];
+        const changesToBeCommitted = [];
+        const deletedStaged = [];
+        const deletedUnstaged = [];
+
+        const filesInCwd = await this.listFilesRecursively('.');
+
+        for (const filePath of filesInCwd) {
+            const relativePath = path.relative(process.cwd(), filePath);
+            if (relativePath.startsWith('.gix') || relativePath.startsWith('.') || relativePath.includes('node_modules')) continue;
+
+            let content;
+            try {
+                content = await fs.readFile(filePath, 'utf-8');
+            } catch (error) {
+                if (error.code === 'ENOENT') {
+                    continue;
+                }
+                throw error;
+            }
+            const currentHash = this.hashObject(content);
+            workingDirectoryFiles.set(relativePath, currentHash);
+
+            const inIndex = indexFiles.has(relativePath);
+            const inHead = headFiles.has(relativePath);
+
+            if (!inIndex && !inHead) {
+                untrackedFiles.push(relativePath);
+            } else if (inIndex && indexFiles.get(relativePath) !== currentHash) {
+                changesNotStaged.push(relativePath);
+            } else if (inHead && !inIndex && headFiles.get(relativePath) !== currentHash) {
+                changesNotStaged.push(relativePath);
+            }
+        }
+
+        for (const [filePath, indexHash] of indexFiles.entries()) {
+            if (!headFiles.has(filePath)) {
+                changesToBeCommitted.push({ type: 'new file', path: filePath });
+            } else if (headFiles.get(filePath) !== indexHash) {
+                changesToBeCommitted.push({ type: 'modified', path: filePath });
+            }
+        }
+
+        for (const [filePath, headHash] of headFiles.entries()) {
+            if (!workingDirectoryFiles.has(filePath) && indexFiles.has(filePath) && indexFiles.get(filePath) === headHash) {
+                 deletedStaged.push(filePath);
+            } else if (!workingDirectoryFiles.has(filePath) && !indexFiles.has(filePath)) {
+                deletedUnstaged.push(filePath);
+            }
+        }
+
+        const currentBranchRef = (await fs.readFile(this.headPath, 'utf-8')).trim();
+        let currentBranchName = "detached HEAD";
+        if (currentBranchRef.startsWith('ref: refs/heads/')) {
+            currentBranchName = currentBranchRef.substring('ref: refs/heads/'.length);
+        }
+        console.log(`On branch ${currentBranchName}`);
+
+        if (changesToBeCommitted.length > 0 || deletedStaged.length > 0) {
+            console.log(chalk.green('\nChanges to be committed:'));
+            console.log(chalk.green('  (use "gix restore --staged <file>..." to unstage)'));
+            for (const change of changesToBeCommitted) {
+                console.log(chalk.green(`\t${change.type}: ${change.path}`));
+            }
+            for (const path of deletedStaged) {
+                 console.log(chalk.green(`\tdeleted: ${path}`));
+            }
+        }
+
+        if (changesNotStaged.length > 0 || deletedUnstaged.length > 0) {
+            console.log(chalk.red('\nChanges not staged for commit:'));
+            console.log(chalk.red('  (use "gix add <file>..." to update what will be committed)'));
+            console.log(chalk.red('  (use "gix restore <file>..." to discard changes in working directory)'));
+            for (const filePath of changesNotStaged) {
+                console.log(chalk.red(`\tmodified: ${filePath}`));
+            }
+            for (const path of deletedUnstaged) {
+                console.log(chalk.red(`\tdeleted: ${path}`));
+            }
+        }
+
+        if (untrackedFiles.length > 0) {
+            console.log(chalk.gray('\nUntracked files:'));
+            console.log(chalk.gray('  (use "gix add <file>..." to include in what will be committed)'));
+            for (const file of untrackedFiles) {
+                console.log(chalk.gray(`\t${file}`));
+            }
+        }
+
+        if (changesToBeCommitted.length === 0 && changesNotStaged.length === 0 && untrackedFiles.length === 0 && deletedStaged.length === 0 && deletedUnstaged.length === 0) {
+            console.log(chalk.yellow('\nnothing to commit, working tree clean'));
+        }
+    }
+
+    async listFilesRecursively(dir) {
+        let files = [];
+        let entries;
+        try {
+            entries = await fs.readdir(dir, { withFileTypes: true });
+        } catch (error) {
+            if (error.code === 'ENOENT') {
+                return [];
+            }
+            throw error;
+        }
+
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                if (entry.name === '.gix' || entry.name.startsWith('.') || entry.name === 'node_modules') continue;
+                files = files.concat(await this.listFilesRecursively(fullPath));
+            } else {
+                files.push(fullPath);
+            }
+        }
+        return files;
+    }
 }
 
-// === CLI Commands Helper ===
-// This helper abstracts the common Gix initialization and readiness
 const withGix = (action) => async (...args) => {
     const gix = new Gix();
     await gix.ready;
-    return action(gix, ...args); // Pass the gix instance and original arguments
+    return action(gix, ...args);
 };
-
-// === CLI Commands ===
 
 program
     .name('gix')
@@ -297,9 +445,7 @@ program
     .command('init')
     .description('Initialize a new gix repo')
     .action(withGix(async (gix) => {
-        // gix is already initialized and ready here
-        // No additional code needed in init's action, as init() is called in constructor.
-        // The console.log from init() inside Gix class already handles the output.
+
     }));
 
 program
@@ -346,6 +492,13 @@ program
     .description('Switch to a different branch')
     .action(withGix(async (gix, branchName) => {
         await gix.checkout(branchName);
+    }));
+
+program
+    .command('status')
+    .description('Show the working tree status (staged, unstaged, untracked changes)')
+    .action(withGix(async (gix) => {
+        await gix.status();
     }));
 
 program.parse(process.argv);
